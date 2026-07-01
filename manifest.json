@@ -1,0 +1,11 @@
+{
+  "id": "obsidian-publish-kit",
+  "name": "Obsidian Publish Kit",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Format the active Markdown note for WeChat, Xiaohongshu, Zhihu, and X without logging in or publishing automatically.",
+  "author": "Obsidian Publish Kit contributors",
+  "authorUrl": "https://github.com/",
+  "isDesktopOnly": false
+}
+

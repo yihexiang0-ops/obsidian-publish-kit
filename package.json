@@ -1,0 +1,30 @@
+{
+  "name": "obsidian-publish-kit",
+  "version": "0.1.0",
+  "description": "Format Obsidian Markdown notes for WeChat, Xiaohongshu, Zhihu, and X.",
+  "main": "main.js",
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "lint": "tsc --noEmit --pretty false"
+  },
+  "keywords": [
+    "obsidian",
+    "wechat",
+    "xiaohongshu",
+    "zhihu",
+    "twitter",
+    "x",
+    "markdown"
+  ],
+  "author": "Obsidian Publish Kit contributors",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.14.11",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.23.0",
+    "obsidian": "^1.5.12",
+    "typescript": "^5.5.3"
+  }
+}
+
