@@ -1,7 +1,7 @@
 {
   "name": "obsidian-publish-kit",
-  "version": "0.1.0",
-  "description": "Format Obsidian Markdown notes for WeChat, Xiaohongshu, Zhihu, and X.",
+  "version": "0.2.0",
+  "description": "Prepare Obsidian Markdown notes as Xiaohongshu-ready caption and card-image packages.",
   "main": "main.js",
   "scripts": {
     "build": "node esbuild.config.mjs production",
@@ -10,12 +10,10 @@
   },
   "keywords": [
     "obsidian",
-    "wechat",
     "xiaohongshu",
-    "zhihu",
-    "twitter",
-    "x",
-    "markdown"
+    "markdown",
+    "rednote",
+    "content-publishing"
   ],
   "author": "Obsidian Publish Kit contributors",
   "license": "MIT",
@@ -25,6 +23,8 @@
     "esbuild": "^0.23.0",
     "obsidian": "^1.5.12",
     "typescript": "^5.5.3"
+  },
+  "dependencies": {
+    "html-to-image": "^1.11.13"
   }
 }
-

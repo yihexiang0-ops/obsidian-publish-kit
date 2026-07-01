@@ -1,41 +1,70 @@
-export type PlatformKey = "wechat" | "xiaohongshu" | "zhihu" | "x";
+export interface PublishKitSettings {
+  cardWidth: number;
+  imageFormat: "png" | "jpeg";
+  coverStrategy: "title-summary" | "title-image";
+  maxBlocksPerCard: number;
+  maxCardCharacters: number;
+  maxTitleLength: number;
+}
 
-export interface AssetInfo {
+export const DEFAULT_SETTINGS: PublishKitSettings = {
+  cardWidth: 1080,
+  imageFormat: "png",
+  coverStrategy: "title-summary",
+  maxBlocksPerCard: 4,
+  maxCardCharacters: 680,
+  maxTitleLength: 34,
+};
+
+export interface DocumentBlock {
+  index: number;
+  type: string;
+  markdown: string;
+  text: string;
+  headingLevel?: number;
+  headingText?: string;
+}
+
+export interface ResolvedAsset {
+  index: number;
   alt: string;
   original: string;
+  link: string;
   path: string | null;
   resolved: boolean;
+  isRemote: boolean;
   extension: string;
+  mimeType: string | null;
+  dataUrl: string | null;
+  exportFileName: string;
+  note?: string;
 }
 
-export interface ThreadSegment {
-  index: number;
-  text: string;
-  weightedLength: number;
+export interface RenderIssue {
+  level: "warning" | "error";
+  message: string;
+  detail?: string;
 }
 
-export interface XiaohongshuCard {
+export interface XhsCard {
   index: number;
+  kind: "cover" | "content";
   title: string;
-  body: string;
+  markdown: string;
+  blockIndexes: number[];
+  exportFileName: string;
+  imageDataUrl?: string;
 }
 
-export interface PlatformOutput {
-  key: PlatformKey;
-  label: string;
-  copyLabel: string;
-  primaryText: string;
-  html?: string;
-  markdown?: string;
-  thread?: ThreadSegment[];
-  cards?: XiaohongshuCard[];
-  checklist: string[];
-}
-
-export interface PublishBundle {
+export interface XhsBundle {
   sourceTitle: string;
   sourcePath: string;
-  assets: AssetInfo[];
-  outputs: PlatformOutput[];
+  coverTitle: string;
+  caption: string;
+  hashtags: string[];
+  blocks: DocumentBlock[];
+  cards: XhsCard[];
+  assets: ResolvedAsset[];
+  issues: RenderIssue[];
 }
 

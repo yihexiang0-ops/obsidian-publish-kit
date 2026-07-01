@@ -1,41 +1,63 @@
 import {
   App,
   ButtonComponent,
+  Component,
+  MarkdownRenderer,
   MarkdownView,
   Modal,
   Notice,
   Plugin,
+  PluginSettingTab,
+  Setting,
   TFile,
   normalizePath,
 } from "obsidian";
-import { buildPublishBundle } from "./formatter";
-import { AssetInfo, PlatformKey, PlatformOutput, PublishBundle } from "./types";
-
-const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "avif"]);
+import { toJpeg, toPng } from "html-to-image";
+import { buildExportManifest, buildXhsBundle } from "./xhs";
+import { DEFAULT_SETTINGS, PublishKitSettings, ResolvedAsset, XhsBundle, XhsCard } from "./types";
+import { slugifyFileName } from "./formatter";
 
 export default class PublishKitPlugin extends Plugin {
+  settings: PublishKitSettings = DEFAULT_SETTINGS;
+
   async onload(): Promise<void> {
-    this.addRibbonIcon("send", "Format current note for platforms", () => {
-      void this.openFormatter();
+    await this.loadSettings();
+
+    this.addRibbonIcon("image-up", "Prepare current note for Xiaohongshu", () => {
+      void this.openWorkspace();
     });
 
     this.addCommand({
-      id: "format-current-note-for-platforms",
-      name: "Format current note for platforms",
+      id: "prepare-current-note-for-xiaohongshu",
+      name: "Prepare current note for Xiaohongshu",
       checkCallback: (checking) => {
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
         if (!view?.file) {
           return false;
         }
         if (!checking) {
-          void this.openFormatter();
+          void this.openWorkspace();
         }
         return true;
       },
     });
+
+    this.addSettingTab(new PublishKitSettingTab(this.app, this));
   }
 
-  async openFormatter(): Promise<void> {
+  async loadSettings(): Promise<void> {
+    const loaded = await this.loadData();
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      ...(loaded ?? {}),
+    };
+  }
+
+  async saveSettings(): Promise<void> {
+    await this.saveData(this.settings);
+  }
+
+  async openWorkspace(): Promise<void> {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     const file = view?.file;
     if (!file) {
@@ -43,77 +65,31 @@ export default class PublishKitPlugin extends Plugin {
       return;
     }
 
-    const markdown = await this.app.vault.cachedRead(file);
-    const assets = this.collectAssets(markdown, file);
-    const bundle = buildPublishBundle(markdown, file.basename, file.path, assets);
-    new PublishKitModal(this.app, this, bundle).open();
+    const bundle = await buildXhsBundle(this.app, file, this.settings);
+    new PublishKitModal(this.app, this, file, bundle).open();
   }
 
-  collectAssets(markdown: string, sourceFile: TFile): AssetInfo[] {
-    const assets = new Map<string, AssetInfo>();
-    const addAsset = (rawTarget: string, alt: string) => {
-      const target = cleanImageTarget(rawTarget);
-      const resolved = this.resolveVaultFile(target, sourceFile);
-      const extension = getExtension(target);
-      if (!IMAGE_EXTENSIONS.has(extension)) {
-        return;
-      }
-
-      const key = target.toLowerCase();
-      if (!assets.has(key)) {
-        assets.set(key, {
-          alt: alt.trim(),
-          original: target,
-          path: resolved?.path ?? null,
-          resolved: Boolean(resolved),
-          extension,
-        });
-      }
-    };
-
-    for (const match of markdown.matchAll(/!\[([^\]]*)]\(([^)\n]+)\)/g)) {
-      addAsset(match[2], match[1]);
-    }
-
-    for (const match of markdown.matchAll(/!\[\[([^\]\n]+)]]/g)) {
-      const [target, alias] = match[1].split("|");
-      addAsset(target.split("#")[0], alias ?? target);
-    }
-
-    return [...assets.values()];
-  }
-
-  resolveVaultFile(target: string, sourceFile: TFile): TFile | null {
-    const linked = this.app.metadataCache.getFirstLinkpathDest(target, sourceFile.path);
-    if (linked instanceof TFile) {
-      return linked;
-    }
-
-    const sourceFolder = sourceFile.parent?.path ?? "";
-    const candidatePath = normalizePath(sourceFolder ? `${sourceFolder}/${target}` : target);
-    const candidate = this.app.vault.getAbstractFileByPath(candidatePath);
-    return candidate instanceof TFile ? candidate : null;
-  }
-
-  async exportBundle(bundle: PublishBundle): Promise<string> {
-    const base = normalizePath(`exports/${safePathSegment(bundle.sourceTitle)}`);
+  async exportBundle(file: TFile, bundle: XhsBundle): Promise<string> {
+    const base = normalizePath(`exports/${slugifyFileName(bundle.sourceTitle)}`);
     const assetsDir = normalizePath(`${base}/assets`);
+    const cardsDir = normalizePath(`${base}/cards`);
+
     await this.ensureFolder("exports");
     await this.ensureFolder(base);
     await this.ensureFolder(assetsDir);
-
-    for (const output of bundle.outputs) {
-      const path = normalizePath(`${base}/${output.key}.${extensionForOutput(output)}`);
-      await this.app.vault.adapter.write(path, exportTextForOutput(output));
-    }
+    await this.ensureFolder(cardsDir);
 
     await this.app.vault.adapter.write(
-      normalizePath(`${base}/asset-checklist.md`),
-      renderAssetChecklist(bundle.assets),
+      normalizePath(`${base}/caption.md`),
+      `${bundle.caption}\n`,
+    );
+    await this.app.vault.adapter.write(
+      normalizePath(`${base}/publish.json`),
+      buildExportManifest(bundle),
     );
 
     for (const asset of bundle.assets) {
-      if (!asset.path) {
+      if (!asset.resolved || asset.isRemote || !asset.path) {
         continue;
       }
       const source = this.app.vault.getAbstractFileByPath(asset.path);
@@ -121,9 +97,13 @@ export default class PublishKitPlugin extends Plugin {
         continue;
       }
       const binary = await this.app.vault.readBinary(source);
-      const targetPath = normalizePath(`${assetsDir}/${source.name}`);
-      await this.app.vault.adapter.writeBinary(targetPath, binary);
+      await this.app.vault.adapter.writeBinary(normalizePath(`${assetsDir}/${asset.exportFileName}`), binary);
     }
+
+    await this.app.vault.adapter.write(
+      normalizePath(`${base}/assets.md`),
+      renderAssetList(bundle.assets),
+    );
 
     return base;
   }
@@ -139,207 +119,403 @@ export default class PublishKitPlugin extends Plugin {
 }
 
 class PublishKitModal extends Modal {
-  private activePlatform: PlatformKey = "wechat";
+  private readonly renderChild = new Component();
+  private captionEl!: HTMLTextAreaElement;
+  private cardPreviewEl!: HTMLDivElement;
+  private cardImageEl!: HTMLDivElement;
+  private structureEl!: HTMLDivElement;
+  private assetsEl!: HTMLDivElement;
+  private issuesEl!: HTMLDivElement;
+  private metaEl!: HTMLDivElement;
+  private renderedCards = new Map<number, HTMLElement>();
+  private isGenerating = false;
 
   constructor(
     app: App,
     private readonly plugin: PublishKitPlugin,
-    private readonly bundle: PublishBundle,
+    private readonly file: TFile,
+    private readonly bundle: XhsBundle,
   ) {
     super(app);
     this.modalEl.addClass("publish-kit-modal");
   }
 
-  onOpen(): void {
-    this.render();
+  async onOpen(): Promise<void> {
+    this.buildLayout();
+    await this.renderCardPreviews();
+    await this.generateCardImages();
   }
 
-  render(): void {
+  onClose(): void {
+    this.renderChild.unload();
+    this.contentEl.empty();
+  }
+
+  private buildLayout(): void {
     const { contentEl } = this;
     contentEl.empty();
 
     const header = contentEl.createDiv({ cls: "publish-kit-header" });
-    const titleWrap = header.createDiv();
-    titleWrap.createEl("h2", {
+    const headCopy = header.createDiv();
+    headCopy.createEl("h2", {
       cls: "publish-kit-title",
-      text: this.bundle.sourceTitle,
+      text: this.bundle.coverTitle,
     });
-    titleWrap.createDiv({
-      cls: "publish-kit-meta",
-      text: `${this.bundle.sourcePath} · ${this.bundle.assets.length} image asset(s)`,
-    });
+    this.metaEl = headCopy.createDiv({ cls: "publish-kit-meta" });
+    this.metaEl.setText(this.describeBundle());
 
-    const tabs = contentEl.createDiv({ cls: "publish-kit-tabs" });
-    for (const output of this.bundle.outputs) {
-      const tab = tabs.createEl("button", {
-        cls: `publish-kit-tab${output.key === this.activePlatform ? " is-active" : ""}`,
-        text: output.label,
-      });
-      tab.addEventListener("click", () => {
-        this.activePlatform = output.key;
-        this.render();
-      });
-    }
-
-    const output = this.currentOutput();
-    const actions = contentEl.createDiv({ cls: "publish-kit-actions" });
+    const actions = header.createDiv({ cls: "publish-kit-actions publish-kit-actions-inline" });
     new ButtonComponent(actions)
-      .setButtonText(output.copyLabel)
+      .setButtonText("Copy caption")
       .setCta()
       .onClick(() => {
-        void this.copyOutput(output);
+        void navigator.clipboard.writeText(this.bundle.caption);
+        new Notice("Copied Xiaohongshu caption.");
       });
     new ButtonComponent(actions)
-      .setButtonText("Export files")
+      .setButtonText("Export package")
       .onClick(() => {
-        void this.exportFiles();
+        void this.exportPackage();
+      });
+    new ButtonComponent(actions)
+      .setButtonText("Regenerate cards")
+      .onClick(() => {
+        void this.generateCardImages();
       });
 
     const grid = contentEl.createDiv({ cls: "publish-kit-grid" });
-    const previewPanel = grid.createDiv({ cls: "publish-kit-panel" });
-    previewPanel.createEl("h3", { text: "Preview" });
-    this.renderPreview(previewPanel.createDiv({ cls: "publish-kit-preview" }), output);
+    const left = grid.createDiv({ cls: "publish-kit-column" });
+    const right = grid.createDiv({ cls: "publish-kit-column" });
 
-    const sidePanel = grid.createDiv({ cls: "publish-kit-panel" });
-    sidePanel.createEl("h3", { text: "Checklist" });
-    for (const item of output.checklist) {
-      sidePanel.createDiv({ cls: "publish-kit-check-item", text: item });
-    }
+    const captionPanel = left.createDiv({ cls: "publish-kit-panel" });
+    captionPanel.createEl("h3", { text: "Caption" });
+    this.captionEl = captionPanel.createEl("textarea", { cls: "publish-kit-caption" });
+    this.captionEl.value = this.bundle.caption;
 
-    sidePanel.createEl("h3", { text: "Images" });
-    if (this.bundle.assets.length === 0) {
-      sidePanel.createDiv({ cls: "publish-kit-empty", text: "No local images detected." });
-    } else {
-      for (const asset of this.bundle.assets) {
-        sidePanel.createDiv({
-          cls: "publish-kit-asset-item",
-          text: `${asset.resolved ? "OK" : "Missing"} · ${asset.alt || asset.original} · ${asset.path ?? asset.original}`,
-        });
+    const cardPanel = left.createDiv({ cls: "publish-kit-panel" });
+    cardPanel.createEl("h3", { text: "Card Preview" });
+    this.cardPreviewEl = cardPanel.createDiv({ cls: "publish-kit-card-list" });
+
+    const generatedPanel = left.createDiv({ cls: "publish-kit-panel" });
+    generatedPanel.createEl("h3", { text: "Generated Card Images" });
+    this.cardImageEl = generatedPanel.createDiv({ cls: "publish-kit-card-image-list" });
+
+    const structurePanel = right.createDiv({ cls: "publish-kit-panel" });
+    structurePanel.createEl("h3", { text: "Original Structure" });
+    this.structureEl = structurePanel.createDiv();
+    renderStructure(this.structureEl, this.bundle);
+
+    const assetsPanel = right.createDiv({ cls: "publish-kit-panel" });
+    assetsPanel.createEl("h3", { text: "Images" });
+    this.assetsEl = assetsPanel.createDiv();
+    renderAssets(this.assetsEl, this.bundle.assets);
+
+    const issuesPanel = right.createDiv({ cls: "publish-kit-panel" });
+    issuesPanel.createEl("h3", { text: "Issues" });
+    this.issuesEl = issuesPanel.createDiv();
+    renderIssues(this.issuesEl, this.bundle.issues);
+  }
+
+  private describeBundle(): string {
+    return `${this.bundle.sourcePath} · ${this.bundle.assets.length} image asset(s) · ${this.bundle.cards.length} cards`;
+  }
+
+  private async renderCardPreviews(): Promise<void> {
+    this.cardPreviewEl.empty();
+    this.renderedCards.clear();
+
+    for (const card of this.bundle.cards) {
+      const shell = this.cardPreviewEl.createDiv({ cls: "publish-kit-card-shell" });
+      shell.style.width = `${this.plugin.settings.cardWidth}px`;
+      shell.createDiv({
+        cls: "publish-kit-card-chip",
+        text: card.kind === "cover" ? "Cover" : `Card ${card.index}`,
+      });
+      shell.createEl("h4", {
+        cls: "publish-kit-card-title",
+        text: card.title,
+      });
+
+      if (card.kind === "cover") {
+        const summary = shell.createDiv({ cls: "publish-kit-cover-summary" });
+        summary.setText(card.markdown || this.bundle.caption);
+      } else {
+        const body = shell.createDiv({ cls: "publish-kit-card-markdown markdown-rendered" });
+        await MarkdownRenderer.render(this.app, card.markdown, body, this.file.path, this.renderChild);
       }
+
+      this.renderedCards.set(card.index, shell);
     }
   }
 
-  renderPreview(container: HTMLElement, output: PlatformOutput): void {
-    if (output.html) {
-      container.createDiv().innerHTML = output.html;
+  private async generateCardImages(): Promise<void> {
+    if (this.isGenerating) {
       return;
     }
 
-    if (output.cards) {
-      for (const card of output.cards) {
-        const item = container.createDiv({ cls: "publish-kit-card-item" });
-        item.createEl("strong", { text: `Card ${card.index}: ${card.title}` });
-        item.createEl("p", { text: card.body });
+    this.isGenerating = true;
+    this.cardImageEl.empty();
+    this.cardImageEl.createDiv({
+      cls: "publish-kit-empty",
+      text: "Generating card images...",
+    });
+
+    try {
+      for (const card of this.bundle.cards) {
+        const shell = this.renderedCards.get(card.index);
+        if (!shell) {
+          continue;
+        }
+
+        await waitForImages(shell);
+        const dataUrl =
+          this.plugin.settings.imageFormat === "jpeg"
+            ? await toJpeg(shell, {
+                cacheBust: true,
+                pixelRatio: 2,
+                quality: 0.95,
+                backgroundColor: "#f7f1e8",
+              })
+            : await toPng(shell, {
+                cacheBust: true,
+                pixelRatio: 2,
+                backgroundColor: "#f7f1e8",
+              });
+        card.imageDataUrl = dataUrl;
       }
-      container.createEl("hr");
-      container.createEl("pre", {
-        cls: "publish-kit-plain",
-        text: output.primaryText,
+
+      this.renderGeneratedImages();
+      this.metaEl.setText(this.describeBundle());
+    } catch (error) {
+      this.cardImageEl.empty();
+      this.cardImageEl.createDiv({
+        cls: "publish-kit-empty",
+        text: `Card rendering failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      new Notice("Publish Kit could not generate card images.");
+    } finally {
+      this.isGenerating = false;
+    }
+  }
+
+  private renderGeneratedImages(): void {
+    this.cardImageEl.empty();
+    const available = this.bundle.cards.filter((card) => card.imageDataUrl);
+
+    if (available.length === 0) {
+      this.cardImageEl.createDiv({
+        cls: "publish-kit-empty",
+        text: "No card images generated yet.",
       });
       return;
     }
 
-    if (output.thread) {
-      for (const segment of output.thread) {
-        const item = container.createDiv({ cls: "publish-kit-thread-item" });
-        item.createDiv({
-          cls: "publish-kit-thread-count",
-          text: `${segment.weightedLength}/280 weighted characters`,
-        });
-        item.createEl("div", {
-          cls: "publish-kit-plain",
-          text: segment.text,
-        });
-      }
-      return;
+    for (const card of available) {
+      const item = this.cardImageEl.createDiv({ cls: "publish-kit-card-image-item" });
+      item.createDiv({
+        cls: "publish-kit-card-image-meta",
+        text: `${card.kind === "cover" ? "Cover" : `Card ${card.index}`} · ${card.exportFileName}.${this.plugin.settings.imageFormat}`,
+      });
+      item.createEl("img", {
+        cls: "publish-kit-card-image-preview",
+        attr: {
+          src: card.imageDataUrl ?? "",
+          alt: card.title,
+        },
+      });
+    }
+  }
+
+  private async exportPackage(): Promise<void> {
+    if (this.bundle.cards.some((card) => !card.imageDataUrl)) {
+      await this.generateCardImages();
     }
 
-    container.createEl("pre", {
-      cls: "publish-kit-plain",
-      text: output.primaryText,
+    const base = await this.plugin.exportBundle(this.file, this.bundle);
+    const cardsDir = normalizePath(`${base}/cards`);
+
+    for (const card of this.bundle.cards) {
+      if (!card.imageDataUrl) {
+        continue;
+      }
+      const target = normalizePath(`${cardsDir}/${card.exportFileName}.${this.plugin.settings.imageFormat}`);
+      await this.app.vault.adapter.writeBinary(target, dataUrlToArrayBuffer(card.imageDataUrl));
+    }
+
+    new Notice(`Exported Xiaohongshu package to ${base}.`);
+  }
+}
+
+class PublishKitSettingTab extends PluginSettingTab {
+  constructor(app: App, private readonly plugin: PublishKitPlugin) {
+    super(app, plugin);
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+
+    new Setting(containerEl)
+      .setName("Card width")
+      .setDesc("Rendered export width in pixels.")
+      .addText((text) =>
+        text
+          .setPlaceholder("1080")
+          .setValue(String(this.plugin.settings.cardWidth))
+          .onChange(async (value) => {
+            const parsed = Number(value);
+            if (Number.isFinite(parsed) && parsed >= 720) {
+              this.plugin.settings.cardWidth = parsed;
+              await this.plugin.saveSettings();
+            }
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Image format")
+      .setDesc("Export card images as PNG or JPEG.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("png", "PNG")
+          .addOption("jpeg", "JPEG")
+          .setValue(this.plugin.settings.imageFormat)
+          .onChange(async (value: "png" | "jpeg") => {
+            this.plugin.settings.imageFormat = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Cover strategy")
+      .setDesc("Choose whether the cover stays text-first or prefers image-heavy notes later.")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("title-summary", "Title + summary")
+          .addOption("title-image", "Title + image (reserved)")
+          .setValue(this.plugin.settings.coverStrategy)
+          .onChange(async (value: "title-summary" | "title-image") => {
+            this.plugin.settings.coverStrategy = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Max blocks per card")
+      .setDesc("Start a new card when this block count is reached.")
+      .addSlider((slider) =>
+        slider
+          .setLimits(1, 8, 1)
+          .setValue(this.plugin.settings.maxBlocksPerCard)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            this.plugin.settings.maxBlocksPerCard = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
+      .setName("Max title length")
+      .setDesc("Clamp the generated cover title to this character count.")
+      .addSlider((slider) =>
+        slider
+          .setLimits(18, 48, 1)
+          .setValue(this.plugin.settings.maxTitleLength)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            this.plugin.settings.maxTitleLength = value;
+            await this.plugin.saveSettings();
+          }),
+      );
+  }
+}
+
+function renderStructure(container: HTMLElement, bundle: XhsBundle): void {
+  if (bundle.blocks.length === 0) {
+    container.createDiv({ cls: "publish-kit-empty", text: "No markdown blocks detected." });
+    return;
+  }
+
+  for (const block of bundle.blocks) {
+    const item = container.createDiv({ cls: "publish-kit-structure-item" });
+    const label = block.headingText
+      ? `H${block.headingLevel} · ${block.headingText}`
+      : `${block.type} · ${block.text.slice(0, 48)}`;
+    item.createDiv({ cls: "publish-kit-structure-label", text: label });
+    item.createDiv({
+      cls: "publish-kit-structure-snippet",
+      text: block.text.slice(0, 120) || block.markdown.slice(0, 120),
     });
   }
-
-  currentOutput(): PlatformOutput {
-    return this.bundle.outputs.find((output) => output.key === this.activePlatform) ?? this.bundle.outputs[0];
-  }
-
-  async copyOutput(output: PlatformOutput): Promise<void> {
-    if (output.html && navigator.clipboard && "write" in navigator.clipboard) {
-      try {
-        const ClipboardItemCtor = window.ClipboardItem;
-        if (ClipboardItemCtor) {
-          await navigator.clipboard.write([
-            new ClipboardItemCtor({
-              "text/html": new Blob([output.html], { type: "text/html" }),
-              "text/plain": new Blob([output.primaryText], { type: "text/plain" }),
-            }),
-          ]);
-          new Notice(`Copied ${output.label} HTML.`);
-          return;
-        }
-      } catch {
-        // Fall through to plain-text copy below.
-      }
-    }
-
-    await navigator.clipboard.writeText(output.primaryText);
-    new Notice(`Copied ${output.label} draft.`);
-  }
-
-  async exportFiles(): Promise<void> {
-    const path = await this.plugin.exportBundle(this.bundle);
-    new Notice(`Exported Publish Kit files to ${path}.`);
-  }
 }
 
-function cleanImageTarget(rawTarget: string): string {
-  const trimmed = rawTarget.trim().replace(/^<|>$/g, "");
-  const withoutTitle = trimmed.match(/^("[^"]+"|'[^']+'|\S+)/)?.[1] ?? trimmed;
-  return withoutTitle.replace(/^['"]|['"]$/g, "");
-}
-
-function getExtension(path: string): string {
-  const clean = path.split("?")[0].split("#")[0];
-  const index = clean.lastIndexOf(".");
-  return index === -1 ? "" : clean.slice(index + 1).toLowerCase();
-}
-
-function safePathSegment(value: string): string {
-  const safe = value.replace(/[\\/:*?"<>|#^[\]]/g, "-").replace(/\s+/g, " ").trim();
-  return safe.slice(0, 80) || "untitled";
-}
-
-function extensionForOutput(output: PlatformOutput): "html" | "md" | "txt" {
-  if (output.key === "wechat") {
-    return "html";
-  }
-  if (output.key === "x") {
-    return "txt";
-  }
-  return "md";
-}
-
-function exportTextForOutput(output: PlatformOutput): string {
-  if (output.key === "wechat" && output.html) {
-    return output.html;
-  }
-  if (output.cards) {
-    return output.markdown ? `${output.markdown}\n\n## Caption\n\n${output.primaryText}` : output.primaryText;
-  }
-  return output.primaryText;
-}
-
-function renderAssetChecklist(assets: AssetInfo[]): string {
+function renderAssets(container: HTMLElement, assets: ResolvedAsset[]): void {
   if (assets.length === 0) {
-    return "# Asset Checklist\n\nNo local images detected.\n";
+    container.createDiv({ cls: "publish-kit-empty", text: "No images detected." });
+    return;
   }
 
-  const rows = assets.map((asset, index) => {
-    const status = asset.resolved ? "resolved" : "missing";
-    return `- [ ] ${index + 1}. ${asset.alt || asset.original} (${status}) - ${asset.path ?? asset.original}`;
-  });
-
-  return `# Asset Checklist\n\n${rows.join("\n")}\n`;
+  for (const asset of assets) {
+    container.createDiv({
+      cls: "publish-kit-asset-item",
+      text: `${asset.index}. ${asset.resolved ? "OK" : asset.isRemote ? "REMOTE" : "MISSING"} · ${asset.path ?? asset.link}`,
+    });
+  }
 }
 
+function renderIssues(container: HTMLElement, issues: XhsBundle["issues"]): void {
+  if (issues.length === 0) {
+    container.createDiv({ cls: "publish-kit-empty", text: "No rendering issues detected." });
+    return;
+  }
+
+  for (const issue of issues) {
+    const item = container.createDiv({ cls: "publish-kit-issue-item" });
+    item.createDiv({
+      cls: `publish-kit-issue-level is-${issue.level}`,
+      text: issue.level.toUpperCase(),
+    });
+    item.createDiv({ text: issue.message });
+    if (issue.detail) {
+      item.createDiv({
+        cls: "publish-kit-issue-detail",
+        text: issue.detail,
+      });
+    }
+  }
+}
+
+function renderAssetList(assets: ResolvedAsset[]): string {
+  if (assets.length === 0) {
+    return "# Assets\n\nNo images detected.\n";
+  }
+
+  const rows = assets.map((asset) => {
+    const status = asset.resolved ? "resolved" : asset.isRemote ? "remote" : "missing";
+    const path = asset.path ?? asset.link;
+    return `- [ ] ${asset.index}. ${asset.exportFileName} (${status}) - ${path}`;
+  });
+  return `# Assets\n\n${rows.join("\n")}\n`;
+}
+
+async function waitForImages(root: HTMLElement): Promise<void> {
+  const images = Array.from(root.querySelectorAll("img"));
+  await Promise.all(
+    images.map(
+      (img) =>
+        new Promise<void>((resolve) => {
+          if (img.complete) {
+            resolve();
+            return;
+          }
+          img.addEventListener("load", () => resolve(), { once: true });
+          img.addEventListener("error", () => resolve(), { once: true });
+        }),
+    ),
+  );
+}
+
+function dataUrlToArrayBuffer(dataUrl: string): ArrayBuffer {
+  const [, base64 = ""] = dataUrl.split(",", 2);
+  const buffer = Buffer.from(base64, "base64");
+  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+}
